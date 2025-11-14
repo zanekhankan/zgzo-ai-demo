@@ -1,0 +1,10 @@
+{
+  "gc_name": "Test GC Group",
+  "license": "CA 123456",
+  "contact": "test@gcgroup.com",
+  "phone": "555-1234",
+  "markup_percent": 10,
+  "signature": "Test GC Group\nAuthorized Estimator",
+  "legal": "Licensed contractor per CSLB rules.",
+  "logo_filename": ""
+}
