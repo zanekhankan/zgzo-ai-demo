@@ -110,8 +110,11 @@ def naive_parse_line_items(raw_text: str, max_items: int = 150) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def apply_markup(df: pd.DataFrame, global_markup: float) -> pd.DataFrame:
-    """Apply global markup percentage to the extended cost."""
+def apply_markup(df: pd.DataFrame, global_markup_amount: float) -> pd.DataFrame:
+    """
+    Apply a flat dollar markup to the total and allocate it proportionally
+    across all included line items.
+    """
     df = df.copy()
 
     # Filter to included rows only
@@ -122,8 +125,19 @@ def apply_markup(df: pd.DataFrame, global_markup: float) -> pd.DataFrame:
     df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce").fillna(0.0)
 
     df["Base Total"] = df["Quantity"] * df["Unit Cost"]
-    df["Markup %"] = global_markup
-    df["Total w/ Markup"] = df["Base Total"] * (1 + global_markup / 100.0)
+
+    subtotal = df["Base Total"].sum()
+
+    if subtotal <= 0 or global_markup_amount <= 0:
+        # No markup or no base total – nothing fancy to do
+        df["Markup $ Allocated"] = 0.0
+        df["Total w/ Markup"] = df["Base Total"]
+    else:
+        # Allocate the flat markup across rows in proportion to their base total
+        proportion = df["Base Total"] / subtotal
+        df["Markup $ Allocated"] = proportion * global_markup_amount
+        df["Total w/ Markup"] = df["Base Total"] + df["Markup $ Allocated"]
+
     return df
 
 
@@ -322,33 +336,34 @@ with right_col:
 st.markdown("---")
 
 # Markup + totals + export
-st.subheader("3. Apply Markup & Export Bid")
 
+st.subheader("3. Apply Markup & Export Bid")
 if st.session_state.line_items is not None:
     sub_cols = st.columns([1, 3])
     with sub_cols[0]:
-        default_markup = st.session_state.global_markup
-        if st.session_state.selected_gc and isinstance(
-            st.session_state.selected_gc.get("markup_percent", None), (int, float)
-        ):
-            default_markup = float(st.session_state.selected_gc["markup_percent"])
-
-        markup = st.number_input(
-            "Global Markup (%)",
+        # Flat dollar markup – no default from GC for now
+        markup_amount = st.number_input(
+            "Global Markup ($)",
             min_value=0.0,
-            max_value=200.0,
-            value=default_markup,
-            step=1.0,
+            value=float(st.session_state.global_markup),
+            step=500.0,
         )
-        st.session_state.global_markup = markup
+        st.session_state.global_markup = markup_amount
 
-    df_with_totals = apply_markup(st.session_state.line_items, st.session_state.global_markup)
+    df_with_totals = apply_markup(
+        st.session_state.line_items,
+        st.session_state.global_markup,
+    )
 
     with sub_cols[1]:
         subtotal = df_with_totals["Base Total"].sum()
         total_with_markup = df_with_totals["Total w/ Markup"].sum()
+        total_markup_allocated = df_with_totals["Markup $ Allocated"].sum()
+
         st.metric("Base Total", f"${subtotal:,.2f}")
-        st.metric(f"Total w/ {markup:.0f}% Markup", f"${total_with_markup:,.2f}")
+        st.metric("Markup (flat $)", f"${total_markup_allocated:,.2f}")
+        st.metric("Total with Markup", f"${total_with_markup:,.2f}")
+
 
     st.markdown("### 4. Export Bid")
 
