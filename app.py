@@ -6,7 +6,7 @@ from typing import List, Dict
 import streamlit as st
 import pandas as pd
 
-# Optional imports for PDF parsing and export
+# PDF + export libs
 try:
     import PyPDF2
 except ImportError:
@@ -18,8 +18,11 @@ try:
 except ImportError:
     canvas = None
 
+# AI (Groq)
+from groq import Groq
 
-# ------------------ GC PROFILES ------------------ #
+
+# ------------- GC PROFILES ------------- #
 
 GC_DIR = "gc_profiles"
 
@@ -43,7 +46,7 @@ def load_gc_profiles() -> Dict[str, dict]:
     return profiles
 
 
-# ------------------ PDF / DATA UTILITIES ------------------ #
+# ------------- PDF / PARSING ------------- #
 
 def extract_text_from_pdf(file) -> str:
     """Extract raw text from a PDF file-like object."""
@@ -62,19 +65,19 @@ def extract_text_from_pdf(file) -> str:
 
 def naive_parse_line_items(raw_text: str, max_items: int = 150) -> pd.DataFrame:
     """
-    Naive parser for demo:
+    Naive parser:
     - Split lines
-    - Filter to lines that look somewhat like scope items
-    - Limit to max_items so we don't flood the UI
+    - Filter obvious junk
+    - Limit to max_items
     """
     raw_lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
 
     filtered = []
     for ln in raw_lines:
         if len(ln) < 5:
-            continue  # too short, likely junk
+            continue
         if ln.isupper():
-            continue  # section headers / titles
+            continue
         if any(ch.isdigit() for ch in ln):
             filtered.append(ln)
         elif len(filtered) < 30:
@@ -82,42 +85,138 @@ def naive_parse_line_items(raw_text: str, max_items: int = 150) -> pd.DataFrame:
 
     lines = filtered[:max_items]
 
-    data = []
+    rows = []
     for ln in lines:
-        data.append(
+        rows.append(
             {
                 "Include": True,
                 "Item": ln,
                 "Description": "",
                 "Division": "General",
+                "Unit": "LS",
                 "Quantity": 1.0,
                 "Unit Cost": 0.0,
             }
         )
 
-    if not data:
-        data.append(
+    if not rows:
+        rows.append(
             {
                 "Include": True,
                 "Item": "Example Item",
-                "Description": "Sample description",
+                "Description": "Sample scope",
                 "Division": "General",
+                "Unit": "LS",
                 "Quantity": 1.0,
                 "Unit Cost": 100.0,
             }
         )
 
-    return pd.DataFrame(data)
+    return pd.DataFrame(rows)
 
 
-def apply_markup(df: pd.DataFrame, global_markup_amount: float) -> pd.DataFrame:
+# ------------- BRAIN v1 (Groq AI) ------------- #
+
+def ai_clean_line_items(raw_text: str, max_items: int = 40) -> pd.DataFrame:
     """
-    Apply a flat dollar markup to the total and allocate it proportionally
-    across all included line items.
+    Use Groq (Llama 3) to turn messy spec text into a clean list of bid items.
+    Returns a DataFrame with columns:
+    Include, Item, Division, Unit, Quantity, Unit Cost
+    """
+    if not raw_text or len(raw_text.strip()) < 20:
+        return naive_parse_line_items(raw_text, max_items=max_items)
+
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+    system_prompt = (
+        "You are an estimator assistant for a general contractor. "
+        "Your job is to read construction specifications and output ONLY a structured list "
+        "of actionable bid line items.\n\n"
+        "Rules:\n"
+        "- Focus on scope items the GC would actually price (demo, concrete, framing, finishes, etc.).\n"
+        "- Ignore admin text, code references, boilerplate, legal text, and instructions to bidders.\n"
+        "- Group similar scope into practical bid items.\n"
+        "- Use concise, contractor-friendly item names.\n"
+        "- Use simple CSI-style divisions (e.g. '01 General', '02 Demolition', '03 Concrete', "
+        "'06 Carpentry', '08 Openings', '09 Finishes', '21/22/23 MEP').\n"
+        "- If quantity is not clearly known, set it to null.\n"
+        "- Unit can be LS, SF, LF, EA, CY, etc.\n"
+        "- Do NOT invent crazy detail or fake quantities.\n\n"
+        "Output ONLY valid JSON. No commentary, no markdown, no extra text.\n"
+        "JSON must be a list of objects with keys: item, division, unit, quantity."
+    )
+
+    user_prompt = f"""
+You are given construction spec text. Extract up to {max_items} practical bid items.
+
+Spec text:
+\"\"\"
+{raw_text[:12000]}
+\"\"\"
+
+Return JSON like:
+[
+  {{"item": "Mobilization & site setup", "division": "01 General", "unit": "LS", "quantity": 1}},
+  {{"item": "Remove existing carpet flooring", "division": "02 Demolition", "unit": "SF", "quantity": 1500}}
+]
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+        )
+        content = resp.choices[0].message.content.strip()
+        items = json.loads(content)
+    except Exception:
+        return naive_parse_line_items(raw_text, max_items=max_items)
+
+    rows = []
+    for obj in items:
+        item = str(obj.get("item", "")).strip()
+        if not item:
+            continue
+
+        division = str(obj.get("division", "General")).strip()
+        unit = str(obj.get("unit", "LS")).strip()
+        qty = obj.get("quantity", None)
+
+        try:
+            qty_val = float(qty) if qty is not None else 1.0
+        except Exception:
+            qty_val = 1.0
+
+        rows.append(
+            {
+                "Include": True,
+                "Item": item,
+                "Description": "",
+                "Division": division,
+                "Unit": unit,
+                "Quantity": qty_val,
+                "Unit Cost": 0.0,
+            }
+        )
+
+    if not rows:
+        return naive_parse_line_items(raw_text, max_items=max_items)
+
+    return pd.DataFrame(rows)
+
+
+# ------------- MARKUP & EXPORT ------------- #
+
+def apply_markup(df: pd.DataFrame, markup_amount: float) -> pd.DataFrame:
+    """
+    Apply a flat dollar markup to the total and allocate it
+    proportionally across all included line items.
     """
     df = df.copy()
 
-    # Filter to included rows only
     if "Include" in df.columns:
         df = df[df["Include"] == True]
 
@@ -125,38 +224,31 @@ def apply_markup(df: pd.DataFrame, global_markup_amount: float) -> pd.DataFrame:
     df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce").fillna(0.0)
 
     df["Base Total"] = df["Quantity"] * df["Unit Cost"]
-
     subtotal = df["Base Total"].sum()
 
-    if subtotal <= 0 or global_markup_amount <= 0:
-        # No markup or no base total – nothing fancy to do
+    if subtotal <= 0 or markup_amount <= 0:
         df["Markup $ Allocated"] = 0.0
         df["Total w/ Markup"] = df["Base Total"]
     else:
-        # Allocate the flat markup across rows in proportion to their base total
         proportion = df["Base Total"] / subtotal
-        df["Markup $ Allocated"] = proportion * global_markup_amount
+        df["Markup $ Allocated"] = proportion * markup_amount
         df["Total w/ Markup"] = df["Base Total"] + df["Markup $ Allocated"]
 
     return df
 
 
 def export_to_excel(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
-    """Return Excel file bytes for download."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # GC info sheet
-        meta_df = None
         if gc_profile:
             meta_df = pd.DataFrame(
                 {
-                    "Field": ["GC Name", "License", "Contact", "Phone", "Markup %"],
+                    "Field": ["GC Name", "License", "Contact", "Phone"],
                     "Value": [
                         gc_profile.get("gc_name", ""),
                         gc_profile.get("license", ""),
                         gc_profile.get("contact", ""),
                         gc_profile.get("phone", ""),
-                        gc_profile.get("markup_percent", ""),
                     ],
                 }
             )
@@ -169,10 +261,6 @@ def export_to_excel(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
 
 
 def export_to_pdf(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
-    """
-    Very basic PDF export using reportlab.
-    If reportlab is not installed, we just return empty bytes.
-    """
     if canvas is None:
         return b""
 
@@ -182,7 +270,6 @@ def export_to_pdf(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
     x = 40
     y = height - 40
 
-    # GC Header
     c.setFont("Helvetica-Bold", 14)
     if gc_profile:
         c.drawString(x, y, gc_profile.get("gc_name", "ZGZO.AI Bid"))
@@ -192,29 +279,26 @@ def export_to_pdf(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
 
     c.setFont("Helvetica", 9)
     if gc_profile:
-        header_lines = [
+        lines = [
             f"License: {gc_profile.get('license', '')}",
             f"Contact: {gc_profile.get('contact', '')}",
             f"Phone: {gc_profile.get('phone', '')}",
         ]
-        for ln in header_lines:
+        for ln in lines:
             if ln.strip():
                 c.drawString(x, y, ln)
                 y -= 12
 
     y -= 10
 
-    # Table headers
     c.setFont("Helvetica-Bold", 10)
     headers = ["Item", "Division", "Qty", "Unit Cost", "Total w/ Markup"]
     col_widths = [200, 80, 40, 80, 100]
-
     for i, h in enumerate(headers):
         c.drawString(x + sum(col_widths[:i]), y, h)
     y -= 15
 
     c.setFont("Helvetica", 9)
-
     for _, row in df.iterrows():
         if y < 60:
             c.showPage()
@@ -228,9 +312,9 @@ def export_to_pdf(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
         values = [
             str(row.get("Item", ""))[:70],
             str(row.get("Division", ""))[:20],
-            f'{row.get("Quantity", 0):.2f}',
-            f'{row.get("Unit Cost", 0):.2f}',
-            f'{row.get("Total w/ Markup", 0):.2f}',
+            f"{row.get('Quantity', 0):.2f}",
+            f"${row.get('Unit Cost', 0):.2f}",
+            f"${row.get('Total w/ Markup', 0):.2f}",
         ]
         for i, v in enumerate(values):
             c.drawString(x + sum(col_widths[:i]), y, v)
@@ -242,30 +326,32 @@ def export_to_pdf(df: pd.DataFrame, gc_profile: dict | None) -> bytes:
     return buffer.read()
 
 
-# ------------------ STREAMLIT STATE ------------------ #
+# ------------- STREAMLIT STATE ------------- #
 
 if "line_items" not in st.session_state:
     st.session_state.line_items = None
 
 if "global_markup" not in st.session_state:
-    st.session_state.global_markup = 10.0
+    st.session_state.global_markup = 0.0  # flat $
 
 if "selected_gc" not in st.session_state:
     st.session_state.selected_gc = None
 
+if "raw_text" not in st.session_state:
+    st.session_state.raw_text = ""
 
-# ------------------ APP LAYOUT ------------------ #
 
-st.set_page_config(page_title="ZGZO.AI – Bid Generator Demo", layout="wide")
+# ------------- APP LAYOUT ------------- #
+
+st.set_page_config(page_title="ZGZO.AI – Bid Generator (Demo)", layout="wide")
 
 gc_profiles = load_gc_profiles()
 
 st.title("ZGZO.AI – Bid Generator (Demo)")
-st.caption("Upload plans → generate rough line items → edit → apply markup → export bid.")
+st.caption("Upload specs → AI organizes line items → you edit → apply flat markup → export bid.")
 
 st.markdown("---")
 
-# GC selection row
 gc_col, info_col = st.columns([1.3, 2.7])
 
 with gc_col:
@@ -286,13 +372,13 @@ with info_col:
     if gc:
         st.markdown(f"**GC:** {gc.get('gc_name', '')}")
         st.markdown(f"**License:** {gc.get('license', '')}")
-        contact_line = []
+        contact_parts = []
         if gc.get("contact"):
-            contact_line.append(gc["contact"])
+            contact_parts.append(gc["contact"])
         if gc.get("phone"):
-            contact_line.append(gc["phone"])
-        if contact_line:
-            st.markdown("**Contact:** " + " • ".join(contact_line))
+            contact_parts.append(gc["phone"])
+        if contact_parts:
+            st.markdown("**Contact:** " + " • ".join(contact_parts))
         st.caption(gc.get("legal", ""))
     else:
         st.info("No GC profile selected. You can still use the demo without a profile.")
@@ -301,25 +387,31 @@ st.markdown("---")
 
 left_col, right_col = st.columns([2, 3])
 
-# Left: upload and generate
 with left_col:
-    st.subheader("1. Upload Plans (PDF)")
-    uploaded = st.file_uploader("Upload a plans or spec PDF", type=["pdf"])
+    st.subheader("1. Upload Specs (PDF)")
+    uploaded = st.file_uploader("Upload a plans/spec PDF", type=["pdf"])
 
     if uploaded is not None:
         if st.button("Generate Rough Line Items"):
             with st.spinner("Extracting text and creating rough line items..."):
                 text = extract_text_from_pdf(uploaded)
+                st.session_state.raw_text = text
                 df = naive_parse_line_items(text)
                 st.session_state.line_items = df
 
-# Right: line items table
 with right_col:
     st.subheader("2. Review & Edit Line Items")
 
     if st.session_state.line_items is None:
         st.info("Upload a PDF and click 'Generate Rough Line Items' to begin.")
     else:
+        ai_col, _ = st.columns([1, 3])
+        with ai_col:
+            if st.button("✨ AI Clean & Organize Items"):
+                with st.spinner("Letting ZGZO.AI clean and organize the spec..."):
+                    df_ai = ai_clean_line_items(st.session_state.raw_text or "")
+                    st.session_state.line_items = df_ai
+
         edited_df = st.data_editor(
             st.session_state.line_items,
             num_rows="dynamic",
@@ -335,13 +427,11 @@ with right_col:
 
 st.markdown("---")
 
-# Markup + totals + export
-
 st.subheader("3. Apply Markup & Export Bid")
+
 if st.session_state.line_items is not None:
     sub_cols = st.columns([1, 3])
     with sub_cols[0]:
-        # Flat dollar markup – no default from GC for now
         markup_amount = st.number_input(
             "Global Markup ($)",
             min_value=0.0,
@@ -357,13 +447,12 @@ if st.session_state.line_items is not None:
 
     with sub_cols[1]:
         subtotal = df_with_totals["Base Total"].sum()
-        total_with_markup = df_with_totals["Total w/ Markup"].sum()
         total_markup_allocated = df_with_totals["Markup $ Allocated"].sum()
+        total_with_markup = df_with_totals["Total w/ Markup"].sum()
 
         st.metric("Base Total", f"${subtotal:,.2f}")
         st.metric("Markup (flat $)", f"${total_markup_allocated:,.2f}")
         st.metric("Total with Markup", f"${total_with_markup:,.2f}")
-
 
     st.markdown("### 4. Export Bid")
 
